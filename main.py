@@ -20,6 +20,27 @@ load_dotenv()
 # 1. PYDANTIC SCHEMAS FOR GEMINI EXTRACTION
 # ==========================================
 
+# class YarnRecord(BaseModel):
+#     date: str = Field(description="تاریخ سند یا بارنامه به شمسی مثل 1405/07/19")
+#     yarn_code: str = Field(description="نوع یا نمره/کد نخ مثل نخ 6.20 بوبین یا نخ 1/30 آسیاب یا نخ 50/2")
+#     sender: str = Field(description="فرستنده یا مبدا مثل سهیل نسج یا نساجی طره یزد")
+#     acceptor: str = Field(description="گیرنده یا مقصد مثل نساجی مازندران یا عسگرانی")
+#     weight_kg: float = Field(description="وزن خالص به کیلوگرم (اولویت با دست‌نویس انبار نسبت به بارنامه چاپی)")
+
+# class FabricRow(BaseModel):
+#     sender: str = Field(description="فرستنده مثل نساجی مازندران یا مرشدی")
+#     fabric_code: str = Field(description="کد کالیته یا نوع پارچه مثل 228417/20/H یا روسری آهاری")
+#     date: str = Field(description="تاریخ حواله یا فاکتور به شمسی")
+#     value: float = Field(description="مقدار / متراژ (یا ارزش) هر ردیف")
+
+# class ExtractionResult(BaseModel):
+#     category: Literal["yarn", "fabric", "other"] = Field(
+#         description="تعیین اینکه سند مربوط به نخ است یا پارچه یا سایر موارد (مثل فیش بانکی)"
+#     )
+#     yarn_data: Optional[List[YarnRecord]] = Field(default=None, description="پر شود اگر سند مربوط به نخ است")
+#     fabric_data: Optional[List[FabricRow]] = Field(default=None, description="لیست تمام ردیف‌های پارچه اگر سند مربوط به پارچه است")
+#     summary_persian: str = Field(description="خلاصه کوتاه به فارسی برای نمایش در تلگرام جهت تایید")
+
 class YarnRecord(BaseModel):
     date: str = Field(description="تاریخ سند یا بارنامه به شمسی مثل 1405/07/19")
     yarn_code: str = Field(description="نوع یا نمره/کد نخ مثل نخ 6.20 بوبین یا نخ 1/30 آسیاب یا نخ 50/2")
@@ -31,15 +52,20 @@ class FabricRow(BaseModel):
     sender: str = Field(description="فرستنده مثل نساجی مازندران یا مرشدی")
     fabric_code: str = Field(description="کد کالیته یا نوع پارچه مثل 228417/20/H یا روسری آهاری")
     date: str = Field(description="تاریخ حواله یا فاکتور به شمسی")
-    value: float = Field(description="مقدار / متراژ (یا ارزش) هر ردیف")
+    value: float = Field(description="مقدار / متراژ هر ردیف")
 
 class ExtractionResult(BaseModel):
-    category: Literal["yarn", "fabric", "other"] = Field(
-        description="تعیین اینکه سند مربوط به نخ است یا پارچه یا سایر موارد (مثل فیش بانکی)"
+    category: str = Field(
+        description="فقط یکی از این سه کلمه باشد: yarn یا fabric یا other"
     )
-    yarn_data: Optional[List[YarnRecord]] = Field(default=None, description="پر شود اگر سند مربوط به نخ است")
-    fabric_data: Optional[List[FabricRow]] = Field(default=None, description="لیست تمام ردیف‌های پارچه اگر سند مربوط به پارچه است")
-    summary_persian: str = Field(description="خلاصه کوتاه به فارسی برای نمایش در تلگرام جهت تایید")
+    yarn_data: List[YarnRecord] = Field(
+        description="لیست حواله‌های نخ (اگر سند مربوط به پارچه است، لیست خالی [] برگردان)"
+    )
+    fabric_data: List[FabricRow] = Field(
+        description="لیست ردیف‌های پارچه (اگر سند مربوط به نخ است، لیست خالی [] برگردان)"
+    )
+    summary_persian: str = Field(description="خلاصه کوتاه به فارسی")
+
 
 # ==========================================
 # 2. BOT & CLIENTS SETUP

@@ -1,17 +1,20 @@
 import os
-from dotenv import load_dotenv
-load_dotenv()
 import io
 import json
 import asyncio
 from typing import List, Optional, Literal
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from google import genai
 from google.genai import types as genai_types
 import gspread
+
+# Load local .env if present
+load_dotenv()
 
 # ==========================================
 # 1. PYDANTIC SCHEMAS FOR GEMINI EXTRACTION
@@ -42,22 +45,37 @@ class ExtractionResult(BaseModel):
 # 2. BOT & CLIENTS SETUP
 # ==========================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not BOT_TOKEN or not GEMINI_API_KEY:
+    raise ValueError("❌ Missing BOT_TOKEN or GEMINI_API_KEY environment variables!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Google Sheets Connection (using service_account.json)
-gc = gspread.service_account(filename="service_account.json")
-yarn_sheet = gc.open("Yarn_Tracking").sheet1      # Or open_by_key("SHEET_ID_1")
-fabric_sheet = gc.open("Fabric_Tracking").sheet1  # Or open_by_key("SHEET_ID_2")
+# Google Sheets Connection (Render Env Var OR local service_account.json)
+google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+if google_creds_json:
+    # Used when running on Render
+    creds_dict = json.loads(google_creds_json)
+    gc = gspread.service_account_from_dict(creds_dict)
+else:
+    # Used when running locally on Mac
+    gc = gspread.service_account(filename="service_account.json")
+
+yarn_sheet = gc.open("Yarn_Tracking").sheet1
+fabric_sheet = gc.open("Fabric_Tracking").sheet1
+
+# Auto-create headers if Row 1 is empty
+if not yarn_sheet.row_values(1):
+    yarn_sheet.append_row(["تاریخ (Date)", "نوع / کد نخ (Yarn Code)", "فرستنده (Sender)", "گیرنده (Acceptor)", "وزن خالص - کیلو (Weight kg)"])
+if not fabric_sheet.row_values(1):
+    fabric_sheet.append_row(["فرستنده (Sender)", "کد پارچه (Fabric Code)", "تاریخ (Date)", "مقدار / متراژ (Value)"])
 
 # In-memory queues:
-# photo_buffers[(chat_id, user_id)] = [bytes_img1, bytes_img2, ...]
 photo_buffers: dict[tuple[int, int], list[bytes]] = {}
-# pending_approvals[batch_id] = ExtractionResult
 pending_approvals: dict[str, ExtractionResult] = {}
 
 SYSTEM_PROMPT = """
@@ -66,7 +84,7 @@ SYSTEM_PROMPT = """
 1. تشخیص بده سند مربوط به «نخ» (yarn) است یا «پارچه» (fabric). اگر فیش واریزی بانکی است «other» برگردان.
 2. برای نخ (yarn): اگر هم بارنامه چاپی و هم رسید دست‌نویس وجود دارد، آنها را ترکیب کن و حتماً «وزن خالص» دقیق دست‌نویس را به عنوان وزن ثبت کن. فرستنده و گیرنده را از روی متن کاربر و سند استخراج کن.
 3. برای پارچه (fabric): اگر جدول شامل چند ردیف کد کالیته مختلف است (مثل 228417/20/H و غیره)، تک‌تک ردیف‌ها را جداگانه با کد پارچه و متراژ/مقدار همان ردیف استخراج کن. اگر فاکتور کلی است (مثل حواله طاقه‌ای مرشدی)، جمع کل متراژ را ثبت کن.
-4. تصاویر ممکن است ۹۰ درجه چرخیده باشند؛ آنها را به درستی بخوان.
+4. تصاویر ممکن است ۹۰ درجه چرخیده باشند؛ آنها را به درستی بخوان و اعداد فارسی را به انگلیسی تبدیل کن.
 """
 
 # ==========================================
@@ -79,14 +97,12 @@ async def buffer_photo(message: types.Message):
     if key not in photo_buffers:
         photo_buffers[key] = []
 
-    # Download highest resolution photo into memory
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
     img_stream = io.BytesIO()
     await bot.download_file(file_info.file_path, destination=img_stream)
     photo_buffers[key].append(img_stream.getvalue())
 
-    # If the user happened to write a caption directly on the photo, trigger immediately:
     if message.caption:
         await process_queued_images(message, message.caption)
 
@@ -94,11 +110,25 @@ async def buffer_photo(message: types.Message):
 @dp.message(F.text)
 async def trigger_on_text(message: types.Message):
     key = (message.chat.id, message.from_user.id)
-    # Only act if this user has uploaded photos waiting in the queue
+    text = message.text.strip()
+
+    # Test command to verify the bot is online
+    if text in ["/start", "/ping", "تست"]:
+        await message.reply("✅ ربات حسابداری نخ و پارچه فعال است!\nابتدا عکس(های) حواله را بفرستید و سپس توضیح آن را بنویسید.")
+        return
+
+    # Cancel command to clear accidentally uploaded photos
+    if text in ["/cancel", "لغو", "پاک کردن"]:
+        if key in photo_buffers and photo_buffers[key]:
+            photo_buffers.pop(key, None)
+            await message.reply("🗑️ عکس‌های قبلی پاک شدند. می‌توانید عکس جدید بفرستید.")
+        return
+
+    # Only process if this user has uploaded photos waiting in the queue
     if key not in photo_buffers or len(photo_buffers[key]) == 0:
         return
 
-    await process_queued_images(message, message.text)
+    await process_queued_images(message, text)
 
 
 async def process_queued_images(message: types.Message, user_text: str):
@@ -109,7 +139,6 @@ async def process_queued_images(message: types.Message, user_text: str):
 
     status_msg = await message.reply(f"⏳ در حال بررسی {len(images_bytes)} تصویر با توضیح: «{user_text}»...")
 
-    # Build multimodal contents for Gemini
     contents = [SYSTEM_PROMPT, f"توضیح کاربر در گروه: {user_text}"]
     for img_b in images_bytes:
         contents.append(
@@ -135,30 +164,28 @@ async def process_queued_images(message: types.Message, user_text: str):
         await status_msg.edit_text("ℹ️ این تصویر مربوط به حواله نخ یا پارچه نیست (احتمالاً فیش بانکی است) و ثبت نشد.")
         return
 
-    # Save in pending approvals dictionary
     batch_id = f"{message.chat.id}_{message.message_id}"
     pending_approvals[batch_id] = result
 
-    # Format preview text
     if result.category == "yarn" and result.yarn_data:
-        preview_lines = ["🧶 **تشخیص: حواله نخ**\n"]
+        preview_lines = ["🧶 تشخیص: حواله نخ\n"]
         for y in result.yarn_data:
             preview_lines.append(
-                f"📅 تاریخ: `{y.date}`\n"
-                f"🔹 نوع/کد نخ: `{y.yarn_code}`\n"
-                f"📤 فرستنده: `{y.sender}`\n"
-                f"📥 گیرنده: `{y.acceptor}`\n"
-                f"⚖️ وزن خالص: `{y.weight_kg:,.2f}` کیلوگرم\n"
+                f"📅 تاریخ: {y.date}\n"
+                f"🔹 نوع/کد نخ: {y.yarn_code}\n"
+                f"📤 فرستنده: {y.sender}\n"
+                f"📥 گیرنده: {y.acceptor}\n"
+                f"⚖️ وزن خالص: {y.weight_kg:,.2f} کیلوگرم\n"
             )
     else:
-        preview_lines = [f"🧵 **تشخیص: حواله پارچه ({len(result.fabric_data or [])} ردیف)**\n"]
+        preview_lines = [f"🧵 تشخیص: حواله پارچه ({len(result.fabric_data or [])} ردیف)\n"]
         total_val = 0
         for idx, f_row in enumerate(result.fabric_data or [], 1):
             total_val += f_row.value
             preview_lines.append(
-                f"{idx}. کد: `{f_row.fabric_code}` | مقدار: `{f_row.value:,.0f}` | فرستنده: `{f_row.sender}` ({f_row.date})"
+                f"{idx}. کد: {f_row.fabric_code} | مقدار: {f_row.value:,.0f} | فرستنده: {f_row.sender} ({f_row.date})"
             )
-        preview_lines.append(f"\n📊 **جمع کل:** `{total_val:,.0f}`")
+        preview_lines.append(f"\n📊 جمع کل: {total_val:,.0f}")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -167,7 +194,7 @@ async def process_queued_images(message: types.Message, user_text: str):
         ]
     ])
 
-    await status_msg.edit_text("\n".join(preview_lines), reply_markup=keyboard, parse_mode="Markdown")
+    await status_msg.edit_text("\n".join(preview_lines), reply_markup=keyboard)
 
 
 # ==========================================
@@ -187,12 +214,11 @@ async def handle_approval(callback: types.CallbackQuery):
 
     if action == "reject":
         await callback.message.edit_text(
-            callback.message.text + f"\n\n❌ **لغو شد توسط {user_name}**"
+            callback.message.text + f"\n\n❌ لغو شد توسط {user_name}"
         )
         await callback.answer("لغو شد.")
         return
 
-    # Write to appropriate Google Sheet
     try:
         if result.category == "yarn" and result.yarn_data:
             rows_to_append = [
@@ -211,15 +237,34 @@ async def handle_approval(callback: types.CallbackQuery):
             sheet_name = f"شیت پارچه ({len(rows_to_append)} ردیف)"
 
         await callback.message.edit_text(
-            callback.message.text + f"\n\n✅ **تایید شد توسط {user_name} و در {sheet_name} ثبت گردید.**"
+            callback.message.text + f"\n\n✅ تایید شد توسط {user_name} و در {sheet_name} ثبت گردید."
         )
         await callback.answer("با موفقیت در گوگل شیت ثبت شد!")
     except Exception as e:
-        # Put back in pending so they don't lose it if network hiccups
         pending_approvals[batch_id] = result
         await callback.answer(f"خطا در اتصال به گوگل شیت: {e}", show_alert=True)
 
+
+# ==========================================
+# 5. WEB SERVER FOR RENDER FREE TIER
+# ==========================================
+
+async def health_check(request):
+    return web.Response(text="Bot is alive and running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Health check server listening on port {port}")
+
 async def main():
+    await start_web_server()
+    print("🤖 Bot is polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
